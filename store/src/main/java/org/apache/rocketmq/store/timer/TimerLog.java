@@ -111,13 +111,18 @@ public class TimerLog {
     }
 
     public void shutdown() {
-        this.mappedFileQueue.flush(0);
-        //it seems do not need to call shutdown
+        try {
+            this.mappedFileQueue.flush(0);
+        } catch (Throwable e) {
+            log.error("flush error when shutdown", e);
+        }
+
+        this.mappedFileQueue.cleanResourcesAll();
     }
 
     // be careful.
     // if the format of timerlog changed, this offset has to be changed too
-    // so dose the batch writing
+    // so does the batch writing
     public int getOffsetForLastUnit() {
 
         return fileSize - (fileSize - MIN_BLANK_LEN) % UNIT_SIZE - MIN_BLANK_LEN - UNIT_SIZE;

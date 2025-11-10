@@ -39,6 +39,7 @@ import org.apache.rocketmq.tieredstore.exception.TieredStoreException;
 import org.apache.rocketmq.tieredstore.file.FlatFileStore;
 import org.apache.rocketmq.tieredstore.file.FlatMessageFile;
 import org.apache.rocketmq.tieredstore.index.IndexItem;
+import org.apache.rocketmq.tieredstore.index.IndexService;
 import org.apache.rocketmq.tieredstore.metadata.MetadataStore;
 import org.apache.rocketmq.tieredstore.metadata.entity.TopicMetadata;
 import org.apache.rocketmq.tieredstore.util.MessageFormatUtil;
@@ -56,15 +57,24 @@ public class MessageStoreFetcherImpl implements MessageStoreFetcher {
     private final MetadataStore metadataStore;
     private final MessageStoreConfig storeConfig;
     private final TieredMessageStore messageStore;
+    private final IndexService indexService;
     private final FlatFileStore flatFileStore;
     private final long memoryMaxSize;
     private final Cache<String /* topic@queueId@offset */, SelectBufferResult> fetcherCache;
 
     public MessageStoreFetcherImpl(TieredMessageStore messageStore) {
-        this.storeConfig = messageStore.getStoreConfig();
+        this(messageStore, messageStore.getStoreConfig(),
+            messageStore.getFlatFileStore(), messageStore.getIndexService());
+    }
+
+    public MessageStoreFetcherImpl(TieredMessageStore messageStore, MessageStoreConfig storeConfig,
+        FlatFileStore flatFileStore, IndexService indexService) {
+
+        this.storeConfig = storeConfig;
         this.brokerName = storeConfig.getBrokerName();
-        this.flatFileStore = messageStore.getFlatFileStore();
+        this.flatFileStore = flatFileStore;
         this.messageStore = messageStore;
+        this.indexService = indexService;
         this.metadataStore = flatFileStore.getMetadataStore();
         this.memoryMaxSize =
             (long) (Runtime.getRuntime().maxMemory() * storeConfig.getReadAheadCacheSizeThresholdRate());
@@ -138,6 +148,10 @@ public class MessageStoreFetcherImpl implements MessageStoreFetcher {
             if (result.getMessageCount() == maxCount) {
                 break;
             }
+            long maxTransferBytes = messageStore.getMessageStoreConfig().getMaxTransferBytesOnMessageInMemory();
+            if (result.getBufferTotalSize() >= maxTransferBytes) {
+                break;
+            }
         }
         result.setStatus(result.getMessageCount() > 0 ?
             GetMessageStatus.FOUND : GetMessageStatus.NO_MATCHED_MESSAGE);
@@ -192,8 +206,16 @@ public class MessageStoreFetcherImpl implements MessageStoreFetcher {
         log.debug("MessageFetcher cache miss, group={}, topic={}, queueId={}, offset={}, maxCount={}, lag={}",
             group, mq.getTopic(), mq.getQueueId(), queueOffset, maxCount, result.getMaxOffset() - result.getNextBeginOffset());
 
-        return fetchMessageThenPutToCache(flatFile, queueOffset, storeConfig.getReadAheadMessageCountThreshold())
-            .thenApply(maxOffset -> getMessageFromCache(flatFile, queueOffset, maxCount, messageFilter));
+        // To optimize the performance of pop consumption
+        // Pop revive will cause a large number of random reads,
+        // so the amount of pre-fetch message num needs to be reduced.
+        int fetchSize = maxCount == 1 ? 32 : storeConfig.getReadAheadMessageCountThreshold();
+
+        // In the current design, when the min offset cache expires,
+        // this method may trigger an RPC call, causing buffer fetch thread starvation
+        return fetchMessageThenPutToCache(flatFile, queueOffset, fetchSize)
+            .thenApplyAsync(maxOffset -> getMessageFromCache(flatFile, queueOffset, maxCount, messageFilter),
+                messageStore.getStoreExecutor().commonExecutor);
     }
 
     public CompletableFuture<GetMessageResultExt> getMessageFromTieredStoreAsync(
@@ -357,14 +379,7 @@ public class MessageStoreFetcherImpl implements MessageStoreFetcher {
     @Override
     public CompletableFuture<Long> getEarliestMessageTimeAsync(String topic, int queueId) {
         FlatMessageFile flatFile = flatFileStore.getFlatFile(new MessageQueue(topic, brokerName, queueId));
-        if (flatFile == null) {
-            return CompletableFuture.completedFuture(-1L);
-        }
-
-        // read from timestamp to timestamp + length
-        int length = MessageFormatUtil.STORE_TIMESTAMP_POSITION + 8;
-        return flatFile.getCommitLogAsync(flatFile.getCommitLogMinOffset(), length)
-            .thenApply(MessageFormatUtil::getStoreTimeStamp);
+        return CompletableFuture.completedFuture(flatFile == null ? -1L : flatFile.getMinStoreTimestamp());
     }
 
     @Override
@@ -414,8 +429,7 @@ public class MessageStoreFetcherImpl implements MessageStoreFetcher {
             return CompletableFuture.completedFuture(new QueryMessageResult());
         }
 
-        CompletableFuture<List<IndexItem>> future =
-            messageStore.getIndexService().queryAsync(topic, key, maxCount, begin, end);
+        CompletableFuture<List<IndexItem>> future = indexService.queryAsync(topic, key, maxCount, begin, end);
 
         return future.thenCompose(indexItemList -> {
             List<CompletableFuture<SelectMappedBufferResult>> futureList = new ArrayList<>(maxCount);
@@ -426,6 +440,10 @@ public class MessageStoreFetcherImpl implements MessageStoreFetcher {
                 FlatMessageFile flatFile =
                     flatFileStore.getFlatFile(new MessageQueue(topic, brokerName, indexItem.getQueueId()));
                 if (flatFile == null) {
+                    continue;
+                }
+                if (indexItem.getOffset() < flatFile.getCommitLogMinOffset() ||
+                    indexItem.getOffset() > flatFile.getCommitLogMaxOffset()) {
                     continue;
                 }
                 CompletableFuture<SelectMappedBufferResult> getMessageFuture = flatFile

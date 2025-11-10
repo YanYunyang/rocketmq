@@ -28,6 +28,7 @@ import apache.rocketmq.v2.NotifyClientTerminationRequest;
 import apache.rocketmq.v2.Publishing;
 import apache.rocketmq.v2.QueryAssignmentRequest;
 import apache.rocketmq.v2.QueryRouteRequest;
+import apache.rocketmq.v2.RecallMessageRequest;
 import apache.rocketmq.v2.ReceiveMessageRequest;
 import apache.rocketmq.v2.Resource;
 import apache.rocketmq.v2.SendMessageRequest;
@@ -56,6 +57,8 @@ import org.apache.rocketmq.remoting.netty.AttributeKeys;
 import org.apache.rocketmq.remoting.protocol.RemotingCommand;
 import org.apache.rocketmq.remoting.protocol.RequestCode;
 import org.apache.rocketmq.remoting.protocol.RequestHeaderRegistry;
+import org.apache.rocketmq.remoting.protocol.body.LockBatchRequestBody;
+import org.apache.rocketmq.remoting.protocol.body.UnlockBatchRequestBody;
 import org.apache.rocketmq.remoting.protocol.header.ConsumerSendMsgBackRequestHeader;
 import org.apache.rocketmq.remoting.protocol.header.CreateTopicRequestHeader;
 import org.apache.rocketmq.remoting.protocol.header.CreateUserRequestHeader;
@@ -65,6 +68,7 @@ import org.apache.rocketmq.remoting.protocol.header.HeartbeatRequestHeader;
 import org.apache.rocketmq.remoting.protocol.header.PullMessageRequestHeader;
 import org.apache.rocketmq.remoting.protocol.header.QueryConsumerOffsetRequestHeader;
 import org.apache.rocketmq.remoting.protocol.header.QueryMessageRequestHeader;
+import org.apache.rocketmq.remoting.protocol.header.RecallMessageRequestHeader;
 import org.apache.rocketmq.remoting.protocol.header.SendMessageRequestHeader;
 import org.apache.rocketmq.remoting.protocol.header.SendMessageRequestHeaderV2;
 import org.apache.rocketmq.remoting.protocol.header.UnregisterClientRequestHeader;
@@ -121,6 +125,19 @@ public class DefaultAuthorizationContextBuilderTest {
         Assert.assertEquals(result.get(0).getSourceIp(), "192.168.0.1");
         Assert.assertEquals(result.get(0).getChannelId(), "channel-id");
         Assert.assertEquals(result.get(0).getRpcCode(), SendMessageRequest.getDescriptor().getFullName());
+
+        request = RecallMessageRequest.newBuilder()
+            .setTopic(Resource.newBuilder().setName("topic").build())
+            .setRecallHandle("handle")
+            .build();
+        result = builder.build(metadata, request);
+        Assert.assertEquals(1, result.size());
+        Assert.assertEquals(result.get(0).getSubject().getSubjectKey(), "User:rocketmq");
+        Assert.assertEquals(result.get(0).getResource().getResourceKey(), "Topic:topic");
+        Assert.assertTrue(result.get(0).getActions().containsAll(Arrays.asList(Action.PUB)));
+        Assert.assertEquals(result.get(0).getSourceIp(), "192.168.0.1");
+        Assert.assertEquals(result.get(0).getChannelId(), "channel-id");
+        Assert.assertEquals(result.get(0).getRpcCode(), RecallMessageRequest.getDescriptor().getFullName());
 
         request = EndTransactionRequest.newBuilder()
             .setTopic(Resource.newBuilder().setName("topic").build())
@@ -315,6 +332,22 @@ public class DefaultAuthorizationContextBuilderTest {
         Assert.assertEquals("Group:group", result.get(0).getResource().getResourceKey());
         Assert.assertTrue(result.get(0).getActions().containsAll(Arrays.asList(Action.SUB)));
 
+        RecallMessageRequestHeader recallMessageRequestHeader = new RecallMessageRequestHeader();
+        recallMessageRequestHeader.setTopic("topic");
+        recallMessageRequestHeader.setRecallHandle("handle");
+        request = RemotingCommand.createRequestCommand(RequestCode.RECALL_MESSAGE, recallMessageRequestHeader);
+        request.setVersion(441);
+        request.addExtField("AccessKey", "rocketmq");
+        request.makeCustomHeaderToNet();
+        result = builder.build(channelHandlerContext, request);
+        Assert.assertEquals(1, result.size());
+        Assert.assertEquals("User:rocketmq", result.get(0).getSubject().getSubjectKey());
+        Assert.assertEquals("Topic:topic", result.get(0).getResource().getResourceKey());
+        Assert.assertTrue(result.get(0).getActions().containsAll(Arrays.asList(Action.PUB)));
+        Assert.assertEquals("192.168.0.1", result.get(0).getSourceIp());
+        Assert.assertEquals("channel-id", result.get(0).getChannelId());
+        Assert.assertEquals(RequestCode.RECALL_MESSAGE + "", result.get(0).getRpcCode());
+
         EndTransactionRequestHeader endTransactionRequestHeader = new EndTransactionRequestHeader();
         endTransactionRequestHeader.setTopic("topic");
         request = RemotingCommand.createRequestCommand(RequestCode.END_TRANSACTION, endTransactionRequestHeader);
@@ -477,6 +510,66 @@ public class DefaultAuthorizationContextBuilderTest {
         Assert.assertEquals("User:rocketmq", result.get(0).getSubject().getSubjectKey());
         Assert.assertEquals("Cluster:DefaultCluster", result.get(0).getResource().getResourceKey());
         Assert.assertTrue(result.get(0).getActions().containsAll(Arrays.asList(Action.UPDATE)));
+
+        LockBatchRequestBody lockBatchRequestBody = new LockBatchRequestBody();
+        lockBatchRequestBody.setConsumerGroup("group");
+        java.util.Set<org.apache.rocketmq.common.message.MessageQueue> lockMqSet = new java.util.HashSet<>();
+
+        lockMqSet.add(new org.apache.rocketmq.common.message.MessageQueue("topic", "broker-a", 0));
+        // retry topic, should be skipped
+        lockMqSet.add(new org.apache.rocketmq.common.message.MessageQueue("%RETRY%group", "broker-a", 1));
+        lockBatchRequestBody.setMqSet(lockMqSet);
+
+        request = RemotingCommand.createRequestCommand(RequestCode.LOCK_BATCH_MQ, null);
+        request.setBody(JSON.toJSONBytes(lockBatchRequestBody));
+        request.setVersion(441);
+        request.addExtField("AccessKey", "rocketmq");
+        request.makeCustomHeaderToNet();
+
+        result = builder.build(channelHandlerContext, request);
+        Assert.assertEquals(2, result.size());
+
+        Assert.assertEquals("User:rocketmq", getContext(result, ResourceType.GROUP).getSubject().getSubjectKey());
+        Assert.assertEquals("Group:group", getContext(result, ResourceType.GROUP).getResource().getResourceKey());
+        Assert.assertTrue(getContext(result, ResourceType.GROUP).getActions().containsAll(Arrays.asList(Action.SUB)));
+
+        Assert.assertEquals("User:rocketmq", getContext(result, ResourceType.TOPIC).getSubject().getSubjectKey());
+        Assert.assertEquals("Topic:topic", getContext(result, ResourceType.TOPIC).getResource().getResourceKey());
+        Assert.assertTrue(getContext(result, ResourceType.TOPIC).getActions().containsAll(Arrays.asList(Action.SUB)));
+
+        Assert.assertEquals("192.168.0.1", getContext(result, ResourceType.TOPIC).getSourceIp());
+        Assert.assertEquals("channel-id", getContext(result, ResourceType.TOPIC).getChannelId());
+        Assert.assertEquals(String.valueOf(RequestCode.LOCK_BATCH_MQ), getContext(result, ResourceType.TOPIC).getRpcCode());
+
+        UnlockBatchRequestBody unlockBatchRequestBody = new UnlockBatchRequestBody();
+        unlockBatchRequestBody.setConsumerGroup("group");
+        java.util.Set<org.apache.rocketmq.common.message.MessageQueue> unlockMqSet = new java.util.HashSet<>();
+        unlockMqSet.add(new org.apache.rocketmq.common.message.MessageQueue("topic", "broker-a", 0));
+        // retry topic, should be skipped
+        unlockMqSet.add(new org.apache.rocketmq.common.message.MessageQueue("%RETRY%group", "broker-a", 1));
+        unlockBatchRequestBody.setMqSet(unlockMqSet);
+
+        request = RemotingCommand.createRequestCommand(RequestCode.UNLOCK_BATCH_MQ, null);
+        request.setBody(JSON.toJSONBytes(unlockBatchRequestBody));
+        request.setVersion(441);
+        request.addExtField("AccessKey", "rocketmq");
+        request.makeCustomHeaderToNet();
+
+        result = builder.build(channelHandlerContext, request);
+        Assert.assertEquals(2, result.size());
+
+        Assert.assertEquals("User:rocketmq", getContext(result, ResourceType.GROUP).getSubject().getSubjectKey());
+        Assert.assertEquals("Group:group", getContext(result, ResourceType.GROUP).getResource().getResourceKey());
+        Assert.assertTrue(getContext(result, ResourceType.GROUP).getActions().containsAll(Arrays.asList(Action.SUB)));
+
+        Assert.assertEquals("User:rocketmq", getContext(result, ResourceType.TOPIC).getSubject().getSubjectKey());
+        Assert.assertEquals("Topic:topic", getContext(result, ResourceType.TOPIC).getResource().getResourceKey());
+        Assert.assertTrue(getContext(result, ResourceType.TOPIC).getActions().containsAll(Arrays.asList(Action.SUB)));
+
+        Assert.assertEquals("192.168.0.1", getContext(result, ResourceType.TOPIC).getSourceIp());
+        Assert.assertEquals("channel-id", getContext(result, ResourceType.TOPIC).getChannelId());
+        Assert.assertEquals(String.valueOf(RequestCode.UNLOCK_BATCH_MQ), getContext(result, ResourceType.TOPIC).getRpcCode());
+
     }
 
     private DefaultAuthorizationContext getContext(List<DefaultAuthorizationContext> contexts,

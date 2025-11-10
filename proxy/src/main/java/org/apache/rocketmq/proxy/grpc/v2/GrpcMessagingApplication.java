@@ -35,6 +35,8 @@ import apache.rocketmq.v2.QueryAssignmentRequest;
 import apache.rocketmq.v2.QueryAssignmentResponse;
 import apache.rocketmq.v2.QueryRouteRequest;
 import apache.rocketmq.v2.QueryRouteResponse;
+import apache.rocketmq.v2.RecallMessageRequest;
+import apache.rocketmq.v2.RecallMessageResponse;
 import apache.rocketmq.v2.ReceiveMessageRequest;
 import apache.rocketmq.v2.ReceiveMessageResponse;
 import apache.rocketmq.v2.SendMessageRequest;
@@ -356,7 +358,14 @@ public class GrpcMessagingApplication extends MessagingServiceGrpc.MessagingServ
     @Override
     public void changeInvisibleDuration(ChangeInvisibleDurationRequest request,
         StreamObserver<ChangeInvisibleDurationResponse> responseObserver) {
-        Function<Status, ChangeInvisibleDurationResponse> statusResponseCreator = status -> ChangeInvisibleDurationResponse.newBuilder().setStatus(status).build();
+        Function<Status, ChangeInvisibleDurationResponse> statusResponseCreator = status -> {
+            ChangeInvisibleDurationResponse.Builder builder =
+                ChangeInvisibleDurationResponse.newBuilder().setStatus(status);
+            if (Code.TOO_MANY_REQUESTS.equals(status.getCode())) {
+                builder.setReceiptHandle(request.getReceiptHandle());
+            }
+            return builder.build();
+        };
         ProxyContext context = createContext();
         try {
             this.addExecutor(this.consumerThreadPoolExecutor,
@@ -364,6 +373,25 @@ public class GrpcMessagingApplication extends MessagingServiceGrpc.MessagingServ
                 request,
                 () -> grpcMessingActivity.changeInvisibleDuration(context, request)
                     .whenComplete((response, throwable) -> writeResponse(context, request, response, responseObserver, throwable, statusResponseCreator)),
+                responseObserver,
+                statusResponseCreator);
+        } catch (Throwable t) {
+            writeResponse(context, request, null, responseObserver, t, statusResponseCreator);
+        }
+    }
+
+    @Override
+    public void recallMessage(RecallMessageRequest request, StreamObserver<RecallMessageResponse> responseObserver) {
+        Function<Status, RecallMessageResponse> statusResponseCreator =
+            status -> RecallMessageResponse.newBuilder().setStatus(status).build();
+        ProxyContext context = createContext();
+        try {
+            this.addExecutor(this.producerThreadPoolExecutor, // reuse producer thread pool
+                context,
+                request,
+                () -> grpcMessingActivity.recallMessage(context, request)
+                    .whenComplete((response, throwable) ->
+                        writeResponse(context, request, response, responseObserver, throwable, statusResponseCreator)),
                 responseObserver,
                 statusResponseCreator);
         } catch (Throwable t) {
